@@ -78,9 +78,8 @@ class RPMSentencesNew(Dataset):
         # num_gpus = torch.cuda.device_count()
         # embeddings = self.autoencoder.module.get_embedding(imagetensor) if num_gpus > 1 else self.autoencoder.get_embedding(imagetensor)
         embeddings = self.autoencoder.get_embedding(imagetensor)
-
-        target = data['target'].item()
-
+        target = np.zeros((8,))
+        target[data['target'].item()]=1
         return embeddings, target
 
     def __len__(self):

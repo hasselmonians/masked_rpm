@@ -2,11 +2,13 @@
 import os
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 import random
 import time
 import re
+import cv2
 
 seed = 42
 random.seed(seed)
@@ -50,9 +52,13 @@ class RPMPanels(Dataset):
         filename = self.files[fileidx]
         data = np.load(filename)
         image = data['image'].reshape([16,160,160])
-        panel = torch.from_numpy(image[panelidx,:,:]).float() / 255
+        panel = image[panelidx,:,:]
+        panel = torch.from_numpy(panel).float() / 255
+        if random.randint(1,10)%2==0:
+            panel =  torch.flip(panel,(0,1))
+        elif random.randint(1,10)%3==0:
+            panel = torch.flip(panel,(1,))
         label = panel.clone()
-
         return (panel.unsqueeze(0), label.unsqueeze(0))
 
     def __len__(self):
@@ -96,7 +102,6 @@ class ResNetAutoencoder(nn.Module):
             ResidualBlock(128, 256, 2), # N, 256, 10, 10
             nn.Flatten(), # N, 256*10*10
             nn.Linear(256*10*10, self.embed_dim), # N, 512
-            nn.Sigmoid()
         )
 
         self.decoder = nn.Sequential(
@@ -127,7 +132,7 @@ class ResNetAutoencoder(nn.Module):
         x = self.decoder(x)
         return x
 
-def evaluate_model(model, dataloader, device, save_path):
+def evaluate_model(model, dataloader, device, save_path,export_image=True):
 
     os.makedirs(save_path, exist_ok=True) # make file path if it doesn't exist, do nothing otherwise
 
@@ -154,7 +159,11 @@ def evaluate_model(model, dataloader, device, save_path):
                 image = image.cpu().numpy()
                 output = output.cpu().numpy()
                 filename = f"eval_{imgnum}"
-                np.savez(os.path.join(save_path,filename), image=image, output=output)
+                if export_image:
+                    img = np.asarray(np.hstack([image*255,output*255]),dtype=np.uint8)
+                    cv2.imwrite(os.path.join(save_path,f'{filename}.jpg'),img[0])
+                else:
+                    np.savez(os.path.join(save_path,filename), image=image, output=output)
                 imgnum += 1
                 idx += 1
                 if imgnum % 50 == 49:
@@ -162,19 +171,21 @@ def evaluate_model(model, dataloader, device, save_path):
                     run_time = end_time - start_time
                     print(f"50 images processed in {run_time} seconds\n")
 
+
     return total_loss/len(dataloader.dataset)
 
 def main():
     # Define Hyperparameters
     EPOCHS = 10
-    BATCH_SIZE = 32
-    LEARNING_RATE = 0.001
+    BATCH_SIZE = 64
+    LEARNING_RATE = 0.0005
 
     # Initialize device, data loader, model, optimizer, and loss function
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
     num_gpus = torch.cuda.device_count()
 
-    root_dir = '../pgm/neutral/'
+    root_dir = '/scratch/Datasets/RPM/RAVEN-10000/'
     train_files, val_files, test_files = gather_files_pgm(root_dir)
 
     # # Uncomment if using RAVEN data
@@ -198,54 +209,57 @@ def main():
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    autoencoder = ResNetAutoencoder().to(device)
+    train_length = len(train_dataloader)
+    autoencoder = ResNetAutoencoder(256).to(device)
 
     if num_gpus > 1: # use multiple GPUs
         autoencoder = nn.DataParallel(autoencoder)
 
     # Comment out if training
-    state_dict = torch.load('../modelsaves/autoencoder_v1_ep1.pth')
+    state_dict = torch.load(f"/scratch/mahirp/Projects/masked_rpm/autoencoder_v1_ep{1}.pth")
     autoencoder.load_state_dict(state_dict)
-    autoencoder.eval()
-
-    # optimizer = torch.optim.Adam(list(autoencoder.parameters()),
-    #                              lr=LEARNING_RATE)
-    # criterion = nn.MSELoss()
-    #
-    # # Training loop
-    # for epoch in range(EPOCHS):
-    #     for idx, (images,_) in enumerate(train_dataloader):
-    #
-    #         if idx%150 == 0:
-    #             start_time = time.time()
-    #
-    #         # move images to the device, reshape them and ensure channel dimension is present
-    #         images = images.to(device)
-    #
-    #         # forward pass
-    #         outputs = autoencoder(images)
-    #         loss = criterion(outputs, images)
-    #
-    #         # backward pass and optimization
-    #         loss.backward()
-    #         optimizer.step()
-    #         optimizer.zero_grad()
-    #
-    #         if idx%150==149:
-    #             end_time = time.time()
-    #             batch_time = end_time - start_time
-    #             print(f"150 mini-batches took {batch_time} seconds")
-    #             print(f"Most recent batch loss: {loss.item()}\n")
-    #
-    #     print("Epoch [{}/{}], Loss: {:.4f}\n".format(epoch + 1, EPOCHS, loss.item()))
-    #     torch.save(autoencoder.state_dict(), f"../modelsaves/autoencoder_v1_ep{epoch+1}.pth")
-
-    # Evaluate the model
-    avg_val_loss = evaluate_model(autoencoder, val_dataloader, device, save_path='../ae_results/v1')
-
-    output_file_path = "../ae_results/v1/avg_val_loss.txt"
-    with open(output_file_path, "w") as file:
-        file.write(f"Average validation loss: {avg_val_loss}")
+    # autoencoder.eval()
+    # evaluate_model(autoencoder,val_dataloader,device,'/scratch/mahirp/Projects/masked_rpm/ae_test_output/')
+    # exit()
+    optimizer = torch.optim.Adam(list(autoencoder.parameters()),
+                                 lr=LEARNING_RATE)
+    criterion = nn.MSELoss()
+    scheduler = ExponentialLR(optimizer, gamma=0.98)
+    # Training loop
+    val_loss = -1
+    for epoch in range(EPOCHS):
+        for idx, (images,_) in enumerate(train_dataloader):
+            # move images to the device, reshape them and ensure channel dimension is present
+            images = images.to(device)
+            # forward pass
+            outputs = autoencoder(images)
+            loss = criterion(outputs, images)
+            # backward pass and optimization
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            if idx%1000 == 0:
+                scheduler.step()
+            if idx%300 == 0:
+                autoencoder.eval()
+                with torch.no_grad():
+                    val_i=0
+                    break_point=random.randint(5,15)
+                    for batch in val_dataloader:
+                        val_i+=1
+                        # assuming that the data loader returns images and labels, but we don't need labels here
+                        images, _ = batch
+                        # move images to the device, reshape them and ensure channel dimension is present
+                        images = images.to(device)
+                        # forward pass
+                        outputs = autoencoder(images)
+                        val_loss = criterion(outputs, images)
+                        if val_i==break_point:
+                            break
+            if idx%50==0:
+                print(f"\r{idx}/{train_length}: loss : {loss.item()} lr :{scheduler.get_last_lr()[0]} val: {val_loss}",end='')
+        print('\n')
+        torch.save(autoencoder.state_dict(), f"/scratch/mahirp/Projects/masked_rpm/autoencoder_v1_ep{epoch+1}.pth")
 
 if __name__ == "__main__":
     main()

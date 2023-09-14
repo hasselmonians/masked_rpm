@@ -6,68 +6,6 @@ import torch.utils.checkpoint
 from torch.jit import Final
 from timm.layers import Mlp, DropPath, use_fused_attn
 
-class TransformerModelMNIST(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=16, mlp_ratio=4., \
-                 norm_layer=nn.LayerNorm, con_depth=8, can_depth=8, guess_depth=8):
-        super(TransformerModelMNIST, self).__init__()
-
-        self.model_dim = embed_dim
-
-        self.perception = ResNetEncoder(embed_dim=self.model_dim)
-
-        self.con_blocks = nn.ModuleList([
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)
-            for _ in range(con_depth)])
-
-        self.can_blocks = nn.ModuleList([
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)
-            for _ in range(can_depth)])
-
-        self.first_guess_block = nn.ModuleList([nn.ModuleList([
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer),
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)])
-            ])
-
-        self.guess_blocks = nn.ModuleList([nn.ModuleList([
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer),
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)])
-            for _ in range(guess_depth-1)
-                             ])
-
-        self.norm = norm_layer(self.model_dim)
-
-        self.lin = nn.Linear(self.model_dim, 1)
-
-    def forward(self, x):
-        batch_size = x.size(0)  # Get the batch size from the first dimension of x
-
-        # apply perception module to all images
-        x_reshaped = x.view(-1, 1, 160, 160)  # x is (B, 16, 1, 160, 160)
-        y_reshaped = self.perception(x_reshaped)
-        y = y_reshaped.view(batch_size, 16, -1)
-
-        context = y[:,0:8,:] # x is (B, 16, embed_dim)
-        candidates = y[:,8:,:]
-
-        for blk in self.con_blocks: # multi-headed self-attention layer
-            context = blk(x_q=context, x_k=context, x_v=context)
-
-        for blk in self.can_blocks:
-            candidates = blk(x_q=candidates, x_k=candidates, x_v=candidates)
-
-        for blk1,blk2 in self.first_guess_block:
-            z = blk1(x_q=context, x_k=candidates, x_v=candidates)
-            z = blk2(x_q=candidates, x_k=z, x_v=z)
-
-        for blk1, blk2 in self.guess_blocks:
-            z = blk1(x_q=context, x_k=z, x_v=z)
-            z = blk2(x_q=candidates, x_k=z, x_v=z)
-
-        z_reshaped = z.view(-1,self.model_dim)
-        guess_reshaped = self.lin(z_reshaped)
-        guess = guess_reshaped.view(batch_size,8)
-
-        return guess
 
 class TransformerModelv5(nn.Module):
     def __init__(self, embed_dim=512, grid_size=3, num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm, \
@@ -295,7 +233,7 @@ class Attention(nn.Module):
             v_bias=False,
             qk_norm=False,
             attn_drop=0.,
-            proj_drop=0.,
+            proj_drop=0.01,
             norm_layer=nn.LayerNorm,
     ):
         super().__init__()
@@ -343,7 +281,6 @@ class Attention(nn.Module):
 
         x = x.transpose(1, 2).reshape(batch_size, len_q, c)
         x = self.proj(x)
-        x = self.proj_drop(x)
         return x
 
 class LayerScale(nn.Module):
@@ -414,12 +351,12 @@ class Block(nn.Module):
 '''' Previous Transformer Models '''''
 class TransformerModelv3(nn.Module):
     def __init__(self, embed_dim=512, grid_size=3, num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm, con_depth=6,\
-                 can_depth=4, guess_depth=4, cat=True):
+                 can_depth=4, guess_depth=4, cat=False):
         super(TransformerModelv3, self).__init__()
 
         self.cat = cat
 
-        if self.cat == True:
+        if self.cat:
             self.model_dim = 2*embed_dim
         else:
             self.model_dim = embed_dim
@@ -436,16 +373,17 @@ class TransformerModelv3(nn.Module):
         self.can_blocks = nn.ModuleList([
             Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)
             for _ in range(can_depth)])
+        self.flatten = nn.Flatten()
+        # self.guess_blocks = nn.ModuleList([nn.ModuleList([
+        #     Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer),
+        #     Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)])
+        #     for _ in range(guess_depth)
+        #                      ])
 
-        self.guess_blocks = nn.ModuleList([nn.ModuleList([
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer),
-            Block(self.model_dim, num_heads, mlp_ratio, q_bias=True, k_bias=True, v_bias=True, norm_layer=norm_layer)])
-            for _ in range(guess_depth)
-                             ])
-
-        self.norm = norm_layer(self.model_dim)
-
-        self.lin = nn.Linear(self.model_dim, 1)
+        # self.norm = norm_layer(self.model_dim)
+        #
+        self.lin = nn.Linear(self.model_dim*8, 8)
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
         batch_size = x.size(0)  # Get the batch size from the first dimension of x
@@ -453,7 +391,7 @@ class TransformerModelv3(nn.Module):
         context = x[:,0:8,:] # x is (B, 16, embed_dim)
         candidates = x[:,8:,:]
 
-        if self.cat == True:
+        if self.cat:
             context = torch.cat([context, self.pos_embed[0:8].unsqueeze(0).expand(batch_size, -1, -1)],\
                                 dim=2)  # add positional embeddings
             candidates = torch.cat([candidates, self.pos_embed[8].unsqueeze(0).expand(batch_size, 8, -1)],\
@@ -466,19 +404,8 @@ class TransformerModelv3(nn.Module):
             context = blk(x_q=context, x_k=context, x_v=context)
 
         for blk in self.can_blocks:
-            candidates = blk(x_q=candidates, x_k=candidates, x_v=candidates)
-
-        y = candidates.clone()
-
-        for blk1, blk2 in self.guess_blocks:
-            y = blk1(x_q=context, x_k=y, x_v=y)
-            y = blk2(x_q=candidates, x_k=y, x_v=y)
-
-        y_reshaped = y.view(-1, self.model_dim)
-        guess_reshaped = self.lin(y_reshaped)
-        guess = guess_reshaped.view(batch_size, 8)
-
-        return guess
+            candidates = blk(x_q=candidates, x_k=context, x_v=context)
+        return self.softmax(self.lin(self.flatten(candidates)))
 
 '''' Previous Transformer Model, relying on Block class from timm '''''
 class TransformerModelv1(nn.Module):
